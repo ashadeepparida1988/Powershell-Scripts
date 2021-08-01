@@ -1,0 +1,148 @@
+Connect-AzAccount
+$mailto = "**************"
+$emailFrom = "***********"
+$smtpServer = "smtp.gmail.com", "587" #SMTP Server.
+$smtpUsername = "************"
+$smtpPassword = "*****"
+
+#declare and initiate variables
+$subject = "$subscription Subscription Azure VM Backup Status"
+$today = get-date -Format ("MM-dd-yyyy")
+$oFile = "$($env:TEMP)\Backup_Status_$($today).csv"
+$backupStatHTML = "$($env:TEMP)\Backup_Status_$($today).html"
+$listOfAttachments = @() 
+if(Test-Path $oFile){
+    Remove-Item $oFile -Force
+}
+if(Test-Path $backupStatHTML){
+    Remove-Item $backupStatHTML -Force
+}
+"VirtualMachine, VM Status, Vault Name, Vault Resource Group,  Protection Status, Protection State, Last Backup Status,Last Backup Date, Policy Name, Container Type, Container Name "  |  Out-File $oFile -Append -Encoding ASCII
+
+$allServerBackupStatusArray = @()
+Get-AzRecoveryServicesVault | ForEach-Object{
+    $vault = $_.Name
+    $vaultResourceGroup = $_.ResourceGroupName
+    Set-AzRecoveryServicesVaultContext -Vault $_
+    Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM | ForEach-Object{
+        Get-AzRecoveryServicesBackupItem -Container $_ -WorkloadType AzureVM | ForEach-Object{
+            $protectionStatus = $protectionState = $lastBackupStatus = $lastBackupTime = $policyName = $containerType = $containerName = $vmDetails = $vmStatus = ""
+            $vmName = $_.VirtualMachineId.Split("/")[-1]
+            $vmDetails = Get-AzResource -ResourceType Microsoft.Compute/virtualMachines -Name $vmName
+            if($vmDetails){$vmStatus = "Active VM"}else{$vmStatus = "Deleted VM"}
+            $protectionStatus = $_.protectionStatus
+            $protectionState = $_.protectionState
+            $lastBackupStatus = $_.lastBackupStatus
+            $lastBackupTime = $_.lastBackupTime
+            $policyName = $_.ProtectionPolicyName
+            $containerType = $_.containerType
+            $containerName = $_.containerName.Split(";")[0]
+            $obj = New-Object psobject
+            $obj | Add-Member NoteProperty VaultName $vault
+            $obj | Add-Member NoteProperty VaultResourceGroup $vaultResourceGroup
+            $obj | Add-Member NoteProperty VMName $vmName
+            $obj | Add-Member NoteProperty VMStatus $vmStatus
+            $obj | Add-Member NoteProperty ProtectionStatus $protectionStatus
+            $obj | Add-Member NoteProperty ProtectionState $protectionState
+            $obj | Add-Member NoteProperty LastBackupStatus $lastBackupStatus
+            $obj | Add-Member NoteProperty LastBackupTime $lastBackupTime
+            $obj | Add-Member NoteProperty PolicyName $policyName
+            $obj | Add-Member NoteProperty ContainerType $containerType
+            $obj | Add-Member NoteProperty ContainerName $containerName
+            $allServerBackupStatusArray += $obj
+        }
+    }
+}
+
+#Get All VM Backup Status
+Get-AzVM | Select-Object Name | ForEach-Object{
+    $vm = $_.Name
+    if($allServerBackupStatusArray.VMName.Contains($vm)){
+        $details = $allServerBackupStatusArray | Where-Object{$_.VMName -eq $vm}
+        "$vm,Active VM,$($details.VaultName),$($details.VaultResourceGroup),$($details.ProtectionStatus),$($details.ProtectionState),$($details.LastBackupStatus),$($details.LastBackupTime),$($details.PolicyName),$($details.ContainerType),$($details.ContainerName)" |  Out-File $oFile -Append -Encoding ASCII
+    }
+    else{
+        "$vm,Active VM,,,,,,,,," |  Out-File $oFile -Append -Encoding ASCII
+    }
+}
+$listOfAttachments += $oFile
+
+#Get Summary of Backup Status to print in email
+$completedBackupCount = $failedBackupCount = $noBackupCount = $protectedVMCount = $unprotectedVMCount = $activeVMCount = $deletedVMCount = 0
+Import-Csv $oFile | ForEach-Object{
+    if($_.'Last Backup Status' -eq 'Completed'){
+        $completedBackupCount +=1
+    }
+    if($_.'Last Backup Status' -eq 'Failed'){
+        $failedBackupCount +=1
+    }
+    if($_.'Last Backup Status' -eq ''){
+        $noBackupCount +=1
+    }
+    if($_.'Last Backup Status' -eq ''){
+        $noBackupCount +=1
+    }
+    if($_.'Protection State' -eq 'Protected'){
+        $protectedVMCount +=1
+    }
+    if($_.'Protection State' -ne 'Protected'){
+        $unprotectedVMCount +=1
+    }
+    if($_.'VM Status' -eq 'Active VM'){
+        $activeVMCount +=1
+    }
+    if($_.'VM Status' -eq 'Deleted VM'){
+        $deletedVMCount +=1
+    }
+}
+
+#generate HTML content
+$Header = @"
+<style>
+TABLE {border-width: 1px;border-style: solid;border-color: black;border-collapse: collapse;}
+TH {border-width: 1px;padding: 3px;border-style: solid;border-color: black;background-color: #4D7657;color:white}
+TD {border-width: 1px;padding: 3px;border-style: solid;border-color: black;}
+P {color:Green;font-weight:bold}
+H4{color:Blue;font-weight:normal}
+H3{color:Blue;font-weight:bold}
+</style>
+<!DOCTYPE html>
+<html>
+<head>
+</head>
+<body style="background-color:#D6EBF2;Font:Arial">
+"@ 
+$Header | Out-File $backupStatHTML -append 
+
+$tableHeader = @"
+<div id="head" style="Text-Align:center">
+<h3 style="color:Blue;font-weight:bold">Azure Virtual Machine Backup Summary Report. For details, refer attachment</h3>
+<hr />
+</div>
+"@
+$tableHeader | Out-File $backupStatHTML -append
+@"
+<div  style="display:inline;Text-Align:center">
+<table><tr><th>Backup Completed</th><th>Backup Failed</th><th>No Backup</th><th>Protected VM</th><th>Unprotected VM</th><th>Deleted VM in Backup</th></tr>
+<tr><td>$completedBackupCount</td><td>$failedBackupCount</td><td>$noBackupCount</td><td>$protectedVMCount</td><td>$unprotectedVMCount</td><td>$deletedVMCount</td></tr></table>
+</div>
+</div>
+</body>
+</html>
+"@ | Out-File $backupStatHTML -append
+
+
+$smtp = New-Object Net.Mail.SmtpClient -ArgumentList $smtpServer
+      $smtp.credentials = New-Object System.Net.NetworkCredential($smtpUsername, $smtpPassword);
+      $msg = New-Object Net.Mail.MailMessage
+     $msg.From = $emailFrom
+     $msg.To.Add($mailto)
+     $msg.Subject = "Azure_Backup_Report"
+     $msg.IsBodyHTML = $true
+     $msg.Body = (gc $backupStatHTML) | Out-String
+     $listOfAttachments |% { $msg.Attachments.Add($_) }
+     #Write $msg.attachments
+     $smtp.EnableSSL = $true
+     $smtp.Send($msg)
+
+Disconnect-AzAccount
